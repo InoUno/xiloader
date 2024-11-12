@@ -24,19 +24,25 @@ This file is part of DarkStar-server source code.
 #ifndef __XILOADER_FUNCTIONS_H_INCLUDED__
 #define __XILOADER_FUNCTIONS_H_INCLUDED__
 
-#if defined (_MSC_VER) && (_MSC_VER >= 1020)
+#if defined(_MSC_VER) && (_MSC_VER >= 1020)
 #pragma once
 #endif
 
+#include <optional>
+#include <string>
+#include <vector>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <windows.h>
-#include <string>
 
 #include <psapi.h>
 
 namespace xiloader
 {
+    struct mac_address
+    {
+        uint8_t bytes[6];
+    };
+
     /**
      * @brief Functions class containing helper functions for various tasks.
      */
@@ -54,7 +60,6 @@ namespace xiloader
         static bool MaskCompare(const unsigned char* lpDataPtr, const unsigned char* lpPattern, const char* pszMask);
 
     public:
-
         /**
          * @brief Locates a signature of bytes using the given mask within the given module.
          *
@@ -94,6 +99,31 @@ namespace xiloader
          * @return installation folder path.
          */
         static const char* GetRegistryPlayOnlineInstallFolder(int lang);
+
+        /**
+         * @brief Finds the MAC address of the network adapter.
+         *
+         * @return The MAC address of the network adapter.
+         */
+        static std::optional<mac_address> GetMACAddress();
+
+        /**
+         * Takes a password as input and masks it.
+         */
+        static void ReadAndMaskPassword(std::string& output);
+
+        /**
+         * Prompts for an input of a certain length until it matches.
+         */
+        static void PromptInput(std::string& output, const size_t minLen, const size_t maxLen, const char* inputText, const char* retryText = "");
+
+        /**
+         * Prompts for an input of a certain length until it matches.
+         */
+        static void PromptMaskedInput(std::string& output, const size_t minLen, const size_t maxLen, const char* inputText, const char* retryText = "");
+
+        static std::string          Base64Encode(const uint8_t* src, const size_t len);
+        static std::vector<uint8_t> Base64Decode(const std::string_view& input);
     };
 
 }; // namespace xiloader

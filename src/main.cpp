@@ -25,10 +25,15 @@ This file is part of DarkStar-server source code.
 #include "defines.h"
 
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <intrin.h>
+#include <iostream>
+#include <optional>
 
 #include "console.h"
 #include "functions.h"
+#include "helpers.h"
 #include "network.h"
 
 #include "argparse/argparse.hpp"
@@ -36,26 +41,33 @@ This file is part of DarkStar-server source code.
 /* Global Variables */
 namespace globals
 {
-    xiloader::Language g_Language        = xiloader::Language::English; // The language of the loader to be used for polcore.
-    std::string        g_ServerAddress   = "127.0.0.1";                 // The server address to connect to.
-    std::string        g_ServerPort      = "51220";                     // The server lobby server port to connect to.
-    std::string        g_LoginDataPort   = "54230";                     // Login server data port to connect to
-    std::string        g_LoginViewPort   = "54001";                     // Login view port to connect to
-    std::string        g_LoginAuthPort   = "54231";                     // Login auth port to connect to
-    std::string        g_Username        = "";                          // The username being logged in with.
-    std::string        g_Password        = "";                          // The password being logged in with.
-    char               g_SessionHash[16] = {};                          // Session hash sent from auth
-    std::string        g_Email           = "";                          // Email, currently unused
-    std::string        g_VersionNumber   = "1.1.2";                     // xiloader version number sent to auth server. Must be x.x.x with single characters for 'x'. Remember to also change in xiloader.rc.in
+    xiloader::Language g_Language = xiloader::Language::English; // The language of the loader to be used for polcore.
 
-    char* g_CharacterList = NULL;  // Pointer to the character list data being sent from the server.
-    bool  g_IsRunning     = false; // Flag to determine if the network threads should hault.
-    bool  g_Hide          = false; // Determines whether or not to hide the console window after FFXI starts.
+    std::string g_ServerAddress; // The server address to connect to.
+
+    uint16_t g_AuthPort      = 15849; // Login server loader port to connect to
+    uint16_t g_PolPort       = 51220; // The POL server port to connect to.
+    uint16_t g_LoginViewPort = 54001; // Login view port to connect to
+
+    std::string           g_Username        = ""; // The username being logged in with.
+    std::string           g_Password        = ""; // The password being logged in with.
+    std::string           g_NewPassword     = ""; // The new password for the account.
+    uint8_t               g_SessionHash[16] = {}; // Session hash sent from auth
+    std::string           g_Email           = ""; // Email
+    xiloader::mac_address g_MacAddress      = {}; // The MAC address for the connection.
+
+    std::string          g_AuthToken = ""; // A provided token that'll be used for authentication.
+    std::vector<uint8_t> g_AuthTokenBytes; // The bytes of the auth token to use.
+
+    std::string g_AuthTokenFile = ""; // The file containing the auth token to use or to be saved to.
+
+    bool  g_IsFirstLogin  = true; // Specifies whether this is the first login attempt.
+    char* g_CharacterList = NULL; // Pointer to the character list data being sent from the server.
 
     /* Hairpin Fix Variables */
     DWORD g_NewServerAddress;     // Hairpin server address to be overriden with.
     DWORD g_HairpinReturnAddress; // Hairpin return address to allow the code cave to return properly.
-};
+};                                // namespace globals
 
 namespace sslState
 {
@@ -67,7 +79,7 @@ namespace sslState
     mbedtls_ssl_config                conf      = {};
     mbedtls_x509_crt                  cacert    = {};
     std::unique_ptr<mbedtls_x509_crt> ca_chain  = {};
-};
+}; // namespace sslState
 
 /**
  * @brief Detour function definitions.
@@ -85,10 +97,12 @@ extern "C"
  */
 __declspec(naked) void HairpinFixCave(void)
 {
-    __asm mov eax, globals::g_NewServerAddress
-    __asm mov [edx + 0x012E90], eax
-    __asm mov [edx], eax
-    __asm jmp globals::g_HairpinReturnAddress
+    __asm {
+        mov eax, globals::g_NewServerAddress
+        mov[edx + 0x012E90], eax
+        mov[edx], eax
+        jmp globals::g_HairpinReturnAddress
+    }
 }
 
 /**
@@ -141,7 +155,7 @@ DWORD ApplyHairpinFixThread(LPVOID lpParam)
     }
 
     /* Apply the hairpin fix.. */
-    auto caveDest = ((int)HairpinFixCave - ((int)hairpinAddress)) - 5;
+    auto caveDest                   = ((int)HairpinFixCave - ((int)hairpinAddress)) - 5;
     globals::g_HairpinReturnAddress = hairpinAddress + 0x08;
 
     *(BYTE*)(hairpinAddress + 0x00) = 0xE9; // jmp
@@ -166,8 +180,6 @@ DWORD ApplyHairpinFixThread(LPVOID lpParam)
  */
 hostent* __stdcall Mine_gethostbyname(const char* name)
 {
-    xiloader::console::output(xiloader::color::debug, "Resolving host: %s", name);
-
     if (!strcmp("ffxi00.pol.com", name))
     {
         return Real_gethostbyname(globals::g_ServerAddress.c_str());
@@ -175,47 +187,28 @@ hostent* __stdcall Mine_gethostbyname(const char* name)
 
     if (!strcmp("pp000.pol.com", name))
     {
-        return Real_gethostbyname("127.0.0.1");
+        return Real_gethostbyname(globals::g_ServerAddress.c_str());
     }
 
     return Real_gethostbyname(name);
 }
 
-// This function's purpose is to identify a command byte and identify if it is meant for the lobby dataport or not.
-// This way, we know we want to send.
-bool isLobbyCommand(const char* buffer)
+/**
+ * Checks if the socket peer is the lobby view socket by its port
+ */
+inline bool isViewSocket(const SOCKET& socket)
 {
-    auto command = buffer[8];
-    // See https://github.com/atom0s/XiPackets/tree/main/lobby
-    // Command bytes information, based on what the client visually reports when waiting for a response:
-    // 0x07: Request login to character with account id and character id. Login verifies this and will notify if possible: "Notifying lobby server of current selections."
-    // 0x14: Request character deletion, login will delete if enabled. "Deleting from lobby server"
-    // 0x1F: Request character list, login server only replies with "0x01": "Acquiring Player Data"
-    // 0x21: Notify server character was created clientside (no effect in login server): "Registering character name onto the lobby server"
-    // 0x22: Notify server of character wishing to be created and login creates the character: "Checking name and Gold World Pass"
-    // 0x24: Client requesting server name: "Acquiring FINAL FANTASY XI server data"
-    // 0x26: Send version information to login, login replies with expansion/features bitmask: "Setting up connection."
-    // 0x28: Client sending character rename information if character was renamed by a GM (Not yet implemented in login)
-    // 0x2B: GM command to move character to a new world? See https://github.com/atom0s/XiPackets/blob/main/lobby/C2S_0x002B_RequestMoveGMChr.md
-    if
-        (command == 0x07 ||
-         command == 0x14 ||
-         command == 0x1F ||
-         command == 0x21 ||
-         command == 0x22 ||
-         command == 0x24 ||
-         command == 0x26 ||
-         command == 0x28 ||
-         command == 0x2B)
+    sockaddr_in addr;
+    int         addr_len = sizeof(addr);
+
+    if (getpeername(socket, (sockaddr*)&addr, &addr_len) != 0)
     {
-        // Check for magic numbers (XIFF command)
-        if (buffer[4] == 0x49 && buffer[5] == 0x58 && buffer[6] == 0x46 && buffer[7] == 0x46)
-        {
-            return true;
-        }
+        return false;
     }
 
-    return false;
+    auto port = ntohs(addr.sin_port);
+
+    return port == globals::g_LoginViewPort;
 }
 
 /**
@@ -224,12 +217,12 @@ bool isLobbyCommand(const char* buffer)
 int WINAPI Mine_send(SOCKET s, const char* buf, int len, int flags)
 {
     const auto ret = _ReturnAddress();
-    std::ignore = ret;
+    std::ignore    = ret;
 
-    // check for lobby specific commands
-    if (isLobbyCommand(buf))
+    // Add in the session hash if it's the view socket
+    if (isViewSocket(s))
     {
-        // always send server provided session hash in packets with XIFF commands and is a lobby command
+        // Always send server provided session hash in packets to the view
         std::memcpy((char*)buf + 12, globals::g_SessionHash, 16);
     }
 
@@ -242,19 +235,124 @@ int WINAPI Mine_send(SOCKET s, const char* buf, int len, int flags)
 int WINAPI Mine_recv(SOCKET s, char* buf, int len, int flags)
 {
     const auto ret = _ReturnAddress();
-    std::ignore = ret;
+    std::ignore    = ret;
 
-    // xiloader::console::output(xiloader::color::lightblue, "recv %i", len);
+    // Check if view socket is receiving characters
+    if (len >= 0x1C && isViewSocket(s))
+    {
+        auto result = Real_recv(s, buf, len, flags);
+        if (buf[0x08] == 0x20)
+        {
+            xiloader::console::output(xiloader::color::lightcyan, "Receiving character list..");
+
+            const uint8_t charSlots = buf[0x1C];
+            for (size_t idx = 0; idx < charSlots; idx++)
+            {
+                globals::g_CharacterList[0x00 + (idx * 0x68)] = 1;
+                globals::g_CharacterList[0x02 + (idx * 0x68)] = 1;
+                globals::g_CharacterList[0x10 + (idx * 0x68)] = (char)idx;
+                globals::g_CharacterList[0x11 + (idx * 0x68)] = 0x80u;
+                globals::g_CharacterList[0x18 + (idx * 0x68)] = 0x20;
+                globals::g_CharacterList[0x28 + (idx * 0x68)] = 0x20;
+
+                const size_t offset = 32 + idx * 140;
+
+                uint32_t contentId   = ref<uint32_t>(buf, offset);
+                uint32_t characterId = ref<uint16_t>(buf, offset + 4) + (buf[offset + 6] << 16) + (buf[offset + 11] << 24);
+                memcpy(globals::g_CharacterList + 0x04 + (idx * 0x68), &characterId, 4); // Character Id
+                memcpy(globals::g_CharacterList + 0x08 + (idx * 0x68), &contentId, 4);   // Content Id
+
+                if (characterId > 0 || contentId > 0)
+                {
+                    xiloader::console::output(xiloader::color::lightcyan, "Found character with ID %u (%x)", contentId, contentId);
+                }
+            }
+        }
+
+        return result;
+    }
+
     return Real_recv(s, buf, len, flags);
 }
+
+std::optional<int> redirectPolConnect(SOCKET s, const sockaddr* name, int namelen)
+{
+    // Change POL connect port if it's different from the default one
+    constexpr uint16_t DEFAULT_POL_PORT = 51220;
+    if (globals::g_PolPort == DEFAULT_POL_PORT)
+    {
+        return std::nullopt;
+    }
+
+    // Check that it's a TCP/IP connection (AF_INET or AF_INET6)
+    if (!(name->sa_family == AF_INET || name->sa_family == AF_INET6))
+    {
+        return std::nullopt;
+    }
+
+    char hostname[NI_MAXHOST];
+    char portstr[NI_MAXSERV];
+
+    // Use NI_NUMERICSERV to get port as number
+    auto result = getnameinfo(name, namelen, hostname, NI_MAXHOST, portstr, NI_MAXSERV, NI_NUMERICSERV);
+
+    if (result != 0)
+    {
+        std::cerr << "getnameinfo failed: " << gai_strerror(result) << std::endl;
+        return std::nullopt;
+    }
+
+    // Get the port number
+    uint16_t port = 0;
+    if (name->sa_family == AF_INET)
+    {
+        port = ntohs(reinterpret_cast<sockaddr_in const*>(name)->sin_port);
+    }
+    else if (name->sa_family == AF_INET6)
+    {
+        port = ntohs(reinterpret_cast<sockaddr_in6 const*>(name)->sin6_port);
+    }
+
+    // Get hostname of the server
+    auto server_host = gethostbyname(hostname);
+
+    // If server hostname matches connect hostname, and the target port is the default POL port, we want to replace it.
+    if (strcmp(hostname, server_host->h_name) == 0 && port == DEFAULT_POL_PORT)
+    {
+        sockaddr_in newAddr;
+        memcpy(&newAddr, name, namelen);
+
+        // Replace port
+        if (name->sa_family == AF_INET)
+        {
+            newAddr.sin_port = htons(globals::g_PolPort);
+        }
+        else if (name->sa_family == AF_INET6)
+        {
+            sockaddr_in6* newAddr6 = reinterpret_cast<sockaddr_in6*>(&newAddr);
+            newAddr6->sin6_port    = htons(globals::g_PolPort);
+        }
+
+        xiloader::console::output(xiloader::color::debug, "Redirected POL to %s:%u", hostname, globals::g_PolPort);
+        return { Real_connect(s, reinterpret_cast<sockaddr*>(&newAddr), namelen) };
+    }
+
+    return std::nullopt;
+}
+
 /**
  * @brief connect detour callback. https://man7.org/linux/man-pages/man2/connect.2.html
  */
 int WINAPI Mine_connect(SOCKET s, const sockaddr* name, int namelen)
 {
-    int ret = Real_connect(s, name, namelen);
+    auto redirect = redirectPolConnect(s, name, namelen);
+    if (redirect.has_value())
+    {
+        return redirect.value();
+    }
 
-    return ret;
+    // Default to original address
+    return Real_connect(s, name, namelen);
 }
 
 /**
@@ -265,7 +363,7 @@ int WINAPI Mine_connect(SOCKET s, const sockaddr* name, int namelen)
 inline DWORD FindINETMutex(void)
 {
     const char* module = (globals::g_Language == xiloader::Language::European) ? "polcoreeu.dll" : "polcore.dll";
-    auto result = (DWORD)xiloader::functions::FindPattern(module, (BYTE*)"\x8B\x56\x2C\x8B\x46\x28\x8B\x4E\x24\x52\x50\x51", "xxxxxxxxxxxx");
+    auto        result = (DWORD)xiloader::functions::FindPattern(module, (BYTE*)"\x8B\x56\x2C\x8B\x46\x28\x8B\x4E\x24\x52\x50\x51", "xxxxxxxxxxxx");
     return (*(DWORD*)(result - 4) + (result));
 }
 
@@ -277,7 +375,7 @@ inline DWORD FindINETMutex(void)
 inline DWORD FindPolConn(void)
 {
     const char* module = (globals::g_Language == xiloader::Language::European) ? "polcoreeu.dll" : "polcore.dll";
-    auto result = (DWORD)xiloader::functions::FindPattern(module, (BYTE*)"\x81\xC6\x38\x03\x00\x00\x83\xC4\x04\x81\xFE", "xxxxxxxxxxx");
+    auto        result = (DWORD)xiloader::functions::FindPattern(module, (BYTE*)"\x81\xC6\x38\x03\x00\x00\x83\xC4\x04\x81\xFE", "xxxxxxxxxxx");
     return (*(DWORD*)(result - 10));
 }
 
@@ -306,8 +404,8 @@ std::unique_ptr<mbedtls_x509_crt> extract_cert(PCCERT_CONTEXT certificateContext
 // Source: https://curl.se/mail/lib-2019-06/0057.html
 std::unique_ptr<mbedtls_x509_crt> build_windows_ca_chain()
 {
-    std::unique_ptr<mbedtls_x509_crt> ca_chain = NULL;
-    HCERTSTORE        certificateStore         = NULL;
+    std::unique_ptr<mbedtls_x509_crt> ca_chain         = NULL;
+    HCERTSTORE                        certificateStore = NULL;
 
     if (certificateStore = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, NULL, CERT_SYSTEM_STORE_CURRENT_USER, L"Root"))
     {
@@ -357,55 +455,83 @@ std::unique_ptr<mbedtls_x509_crt> build_windows_ca_chain()
  */
 int __cdecl main(int argc, char* argv[])
 {
-    argparse::ArgumentParser args("xiloader", "0.0");
+    argparse::ArgumentParser args("xiloader", XILOADER_VERSION_STRING);
+
+    bool bUseHairpinFix = false;
+    bool bHideConsole   = true;
 
     // NOTE: .append() is used to allow multiple arguments to be passed to the same option.
     //     : Otherwise it will throw on repeated arguments (normally accidental).
 
     args.add_argument("--server")
+        .store_into(globals::g_ServerAddress)
+        .default_value("127.0.0.1")
         .help("The server address to connect to.")
         .append();
 
     args.add_argument("--user", "--username")
+        .store_into(globals::g_Username)
+        .default_value("")
         .help("The username being logged in with.")
         .append();
 
     args.add_argument("--pass", "--password")
+        .store_into(globals::g_Password)
+        .default_value("")
         .help("The password being logged in with.")
         .append();
 
     args.add_argument("--email", "--email")
+        .store_into(globals::g_Email)
+        .default_value("")
         .help("The email being logged in with.")
         .append();
 
-    args.add_argument("--serverport")
-        .help("(optional) The server's lobby port to connect to.")
+    args.add_argument("--token")
+        .store_into(globals::g_AuthToken)
+        .default_value("")
+        .help("The auth token being logged in with.")
         .append();
 
-    args.add_argument("--dataport")
-        .help("(optional) The login server data port to connect to.")
-        .append();
-
-    args.add_argument("--viewport")
-        .help("(optional) The login view port to connect to.")
+    args.add_argument("--tokenfile")
+        .store_into(globals::g_AuthTokenFile)
+        .default_value("")
+        .help("Path to file containing the auth token to use or save to.")
         .append();
 
     args.add_argument("--authport")
-        .help("(optional) The login auth port to connect to.")
+        .store_into(globals::g_AuthPort)
+        .default_value(15849)
+        .help("The authentication port to connect to.")
         .append();
 
     args.add_argument("--lang")
-        .help("(optional) The language of your FFXI install: JP/US/EU (0/1/2).")
+        .help("The language of your FFXI install: JP/US/EU (0/1/2).")
         .append();
 
     args.add_argument("--hairpin")
         .implicit_value(true)
-        .help("(optional) Use this if connecting to a local server which you have exposed publicly. This should not have to be used if you are connecting to a remote server.")
+        .store_into(bUseHairpinFix)
+        .default_value(false)
+        .help("Use this if connecting to a local server which you have exposed publicly. This should not have to be used if you are connecting to a remote server.")
         .append();
 
     args.add_argument("--hide")
         .implicit_value(true)
-        .help("(optional) Determines whether or not to hide the console window after FFXI starts.")
+        .store_into(bHideConsole)
+        .default_value(true)
+        .help("Hides the console window after FFXI starts.")
+        .append();
+
+    args.add_argument("--show")
+        .implicit_value(false)
+        // clang-format off
+        .action([&bHideConsole](const std::string& value)
+        {
+            bHideConsole = false;
+        })
+        // clang-format on
+        .help("Keeps the console window open after FFXI starts.")
         .append();
 
     try
@@ -416,19 +542,11 @@ int __cdecl main(int argc, char* argv[])
     {
         std::cerr << err.what() << std::endl;
         std::cerr << args;
-        std::exit(1);
+
+        std::cout << "Press enter to close the window.";
+        std::cin.get();
+        exit(1);
     }
-
-    globals::g_ServerAddress = args.is_used("--server") ? args.get<std::string>("--server") : globals::g_ServerAddress;
-    globals::g_ServerPort    = args.is_used("--serverport") ? args.get<std::string>("--serverport") : globals::g_ServerPort;
-
-    globals::g_LoginDataPort = args.is_used("--dataport") ? args.get<std::string>("--dataport") : globals::g_LoginDataPort;
-    globals::g_LoginViewPort = args.is_used("--viewport") ? args.get<std::string>("--viewport") : globals::g_LoginViewPort;
-    globals::g_LoginAuthPort = args.is_used("--authport") ? args.get<std::string>("--authport") : globals::g_LoginAuthPort;
-
-    globals::g_Username = args.is_used("--user") ? args.get<std::string>("--user") : globals::g_Username;
-    globals::g_Password = args.is_used("--pass") ? args.get<std::string>("--pass") : globals::g_Password;
-    globals::g_Email    = args.is_used("--email") ? args.get<std::string>("--email") : globals::g_Email;
 
     if (args.is_used("--lang"))
     {
@@ -448,24 +566,52 @@ int __cdecl main(int argc, char* argv[])
         }
     }
 
-    bool bUseHairpinFix = args.is_used("--hairpin") ? args.get<bool>("--hairpin") : false;
+    auto macAddressOpt = xiloader::functions::GetMACAddress();
+    if (!macAddressOpt.has_value())
+    {
+        xiloader::console::output(xiloader::color::error, "Could not load necessary information.");
+        exit(1);
+    }
+    globals::g_MacAddress = macAddressOpt.value();
 
-    globals::g_Hide = args.is_used("--hide") ? args.get<bool>("--hide") : globals::g_Hide;
-
-    /* Output the banner.. */
     time_t currentTime = time(NULL);
-    int currentYear = localtime(&currentTime)->tm_year + 1900;  // Year is returned as the number of years since 1900.
+    int    currentYear = localtime(&currentTime)->tm_year + 1900; // Year is returned as the number of years since 1900.
+
     xiloader::console::output(xiloader::color::lightred, "==========================================================");
     xiloader::console::output(xiloader::color::lightgreen, "DarkStar Boot Loader (c) 2015 DarkStar Team");
-    xiloader::console::output(xiloader::color::lightgreen, "LandSandBoat Boot Loader (c) 2021-%d LandSandBoat Team (v%s)", currentYear, globals::g_VersionNumber.c_str());
-    xiloader::console::output(xiloader::color::lightblue, "Using %s", MBEDTLS_VERSION_STRING_FULL); // this prints "Using Mbed TLS #.#.#"
-    xiloader::console::output(xiloader::color::lightpurple, "Git Repo   : https://github.com/LandSandBoat/xiloader");
-    xiloader::console::output(xiloader::color::lightpurple, "Bug Reports: https://github.com/LandSandBoat/xiloader/issues");
+    xiloader::console::output(xiloader::color::lightgreen, "LandSandBoat Boot Loader (c) 2021-2024 LandSandBoat Team");
+    xiloader::console::output(xiloader::color::lightgreen, "XI Boot Loader (c) 2025-%u InoUno (v%s)", currentYear, XILOADER_VERSION_STRING);
+    xiloader::console::output(xiloader::color::lightpurple, "Git Repo   : https://github.com/InoUno/xiloader");
     xiloader::console::output(xiloader::color::lightred, "==========================================================");
+
+    if (!globals::g_AuthTokenFile.empty())
+    {
+        if (std::filesystem::exists(globals::g_AuthTokenFile))
+        {
+            std::ifstream tokenFile;
+            tokenFile.open(globals::g_AuthTokenFile, std::ios_base::in | std::ios_base::binary);
+
+            if (tokenFile.is_open())
+            {
+                tokenFile.seekg(0, tokenFile.end);
+                size_t length = tokenFile.tellg();
+                tokenFile.seekg(0, tokenFile.beg);
+
+                globals::g_AuthTokenBytes.resize(length);
+                tokenFile.read((char*)&globals::g_AuthTokenBytes[0], length);
+                tokenFile.close();
+                xiloader::console::output(xiloader::color::lightgreen, "Loaded auth token from file.", length);
+            }
+        }
+        else if (globals::g_Username.empty() || globals::g_Password.empty())
+        {
+            xiloader::console::output(xiloader::color::error, "Provided auth token file was not found.");
+        }
+    }
 
     /* Initialize Winsock */
     WSADATA wsaData = { 0 };
-    auto ret = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    auto    ret     = WSAStartup(MAKEWORD(2, 2), &wsaData);
     if (ret != 0)
     {
         xiloader::console::output(xiloader::color::error, "Failed to initialize winsock, error code: %d", ret);
@@ -496,7 +642,7 @@ int __cdecl main(int argc, char* argv[])
         CoUninitialize();
         WSACleanup();
 
-        xiloader::console::output(xiloader::color::error, "Failed to detour function 'gethostbyname'. Cannot continue!");
+        xiloader::console::output(xiloader::color::error, "Failed to detour necessary functions. Cannot continue!");
         return 1;
     }
 
@@ -525,25 +671,22 @@ int __cdecl main(int argc, char* argv[])
     if (xiloader::network::ResolveHostname(globals::g_ServerAddress.c_str(), &ulAddress))
     {
         globals::g_ServerAddress = inet_ntoa(*((struct in_addr*)&ulAddress));
+        xiloader::datasocket sock;
 
         /* Attempt to create socket to server..*/
-        xiloader::datasocket sock;
-        if (xiloader::network::CreateAuthConnection(&sock, globals::g_LoginAuthPort.c_str()))
+        if (xiloader::network::CreateAuthConnection(&sock, std::to_string(globals::g_AuthPort).c_str()))
         {
             /* Attempt to verify the users account info.. */
-            while (!xiloader::network::VerifyAccount(&sock))
+            while (!xiloader::network::AuthRequest(&sock))
+            {
                 Sleep(10);
+            }
 
             /* Start hairpin hack thread if required.. */
             if (bUseHairpinFix)
             {
                 CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)ApplyHairpinFixThread, NULL, 0, NULL);
             }
-
-            /* Create listen servers.. */
-            globals::g_IsRunning = true;
-            HANDLE hFFXiServer = CreateThread(NULL, 0, xiloader::network::FFXiServer, &sock, 0, NULL);
-            HANDLE hPolServer = CreateThread(NULL, 0, xiloader::network::PolServer, NULL, 0, NULL);
 
             /* Attempt to create polcore instance..*/
             IPOLCoreCom* polcore = NULL;
@@ -554,19 +697,19 @@ int __cdecl main(int argc, char* argv[])
             else
             {
                 /* Invoke the setup functions for polcore.. */
-                //Create string for the login view port
-                std::string polcorecmd = " /game eAZcFcB -net 3 -port " + globals::g_LoginViewPort;
-                //Cast to an LPSTR
+                // Create string for the login view port
+                std::string polcorecmd = " /game eAZcFcB -net 3 -port " + std::to_string(globals::g_LoginViewPort);
+                // Cast to an LPSTR
                 LPSTR cmd = const_cast<char*>(polcorecmd.c_str());
                 polcore->SetAreaCode(globals::g_Language);
                 polcore->SetParamInit(GetModuleHandle(NULL), cmd);
 
                 /* Obtain the common function table.. */
-                void * (**lpCommandTable)(...);
+                void* (**lpCommandTable)(...);
                 polcore->GetCommonFunctionTable((unsigned long**)&lpCommandTable);
 
                 /* Invoke the inet mutex function.. */
-                auto findMutex = (void * (*)(...))FindINETMutex();
+                auto findMutex = (void* (*)(...))FindINETMutex();
                 findMutex();
 
                 /* Locate and prepare the pol connection.. */
@@ -590,13 +733,16 @@ int __cdecl main(int argc, char* argv[])
                 IFFXiEntry* ffxi = NULL;
                 if (CoCreateInstance(xiloader::CLSID_FFXiEntry, NULL, 0x17, xiloader::IID_IFFXiEntry, (LPVOID*)&ffxi) != S_OK)
                 {
-                    xiloader::console::output(xiloader::color::error, "Failed to initialize instance of FFxi!");
+                    xiloader::console::output(xiloader::color::error, "Failed to initialize instance of FFXI!");
                 }
                 else
                 {
                     /* Attempt to start Final Fantasy.. */
                     IUnknown* message = NULL;
-                    xiloader::console::hide();
+                    if (bHideConsole)
+                    {
+                        xiloader::console::hide();
+                    }
                     ffxi->GameStart(polcore, &message);
                     xiloader::console::show();
                     ffxi->Release();
@@ -604,19 +750,16 @@ int __cdecl main(int argc, char* argv[])
 
                 /* Cleanup polcore object.. */
                 if (polcore != NULL)
+                {
                     polcore->Release();
+                }
             }
 
             /* Cleanup threads.. */
-            globals::g_IsRunning = false;
-            TerminateThread(hFFXiServer, 0);
-            TerminateThread(hPolServer, 0);
+            xiloader::console::output(xiloader::color::lightyellow, "Cleaning up...");
 
-            WaitForSingleObject(hFFXiServer, 1000);
-            WaitForSingleObject(hPolServer, 1000);
-
-            CloseHandle(hFFXiServer);
-            CloseHandle(hPolServer);
+            mbedtls_ssl_close_notify(&sslState::ssl);
+            mbedtls_net_close(&sslState::server_fd);
         }
     }
     else
@@ -646,8 +789,8 @@ int __cdecl main(int argc, char* argv[])
     CoUninitialize();
     WSACleanup();
 
-    xiloader::console::output(xiloader::color::error, "Closing...");
-    Sleep(2000);
+    xiloader::console::output(xiloader::color::lightyellow, "Closing...");
+    Sleep(1000);
 
     return ERROR_SUCCESS;
 }

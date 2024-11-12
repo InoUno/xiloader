@@ -25,23 +25,18 @@ This file is part of DarkStar-server source code.
 
 #include <shobjidl.h>
 
-/* Global Externs */
-namespace globals
-{
-    extern bool g_Hide;
-};
-
 namespace xiloader
 {
     /**
      * @brief Prints a text fragment with the specified color to the console.
-     * 
+     *
      * @param c         The color to print the fragment with.
      * @param message   The fragment to print.
      */
     void console::print(xiloader::color c, std::string const& message)
     {
         auto stdout_handle = ::GetStdHandle(STD_OUTPUT_HANDLE);
+
         ::CONSOLE_SCREEN_BUFFER_INFO info;
         ::GetConsoleScreenBufferInfo(stdout_handle, &info);
         auto attributes = info.wAttributes & 0xFFF0 | static_cast<::WORD>(c);
@@ -57,19 +52,18 @@ namespace xiloader
      */
     void console::visible(bool visible)
     {
-        if (!globals::g_Hide)
-            return;
-
         auto console = ::GetConsoleWindow();
 
         // Adjust the task bar
         ::ITaskbarList* taskbar = nullptr;
+
         auto hr = ::CoCreateInstance(
             CLSID_TaskbarList,
             nullptr,
             ::CLSCTX_INPROC_SERVER,
             IID_ITaskbarList,
             reinterpret_cast<void**>(&taskbar));
+
         if (SUCCEEDED(hr))
         {
             if (visible)

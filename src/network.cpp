@@ -21,8 +21,12 @@ This file is part of DarkStar-server source code.
 ===========================================================================
 */
 
-#include "helpers.h"
 #include "network.h"
+#include "functions.h"
+#include "helpers.h"
+
+#include <fstream>
+#include <iostream>
 #include <iphlpapi.h>
 #include <vector>
 
@@ -30,18 +34,35 @@ This file is part of DarkStar-server source code.
 namespace globals
 {
     extern std::string g_ServerAddress;
+
     extern std::string g_Username;
+    constexpr size_t   g_Username_MinLen = 3;
+    constexpr size_t   g_Username_MaxLen = 32;
+
     extern std::string g_Password;
-    extern char        g_SessionHash[16];
+    extern std::string g_NewPassword;
+    constexpr size_t   g_Password_MinLen = 6;
+    constexpr size_t   g_Password_MaxLen = 32;
+
     extern std::string g_Email;
-    extern std::string g_VersionNumber;
-    extern std::string g_ServerPort;
-    extern std::string g_LoginDataPort;
-    extern std::string g_LoginViewPort;
-    extern std::string g_LoginAuthPort;
-    extern char*       g_CharacterList;
-    extern bool        g_IsRunning;
-}
+    constexpr size_t   g_Email_MinLen = 6;
+    constexpr size_t   g_Email_MaxLen = 64;
+
+    extern xiloader::mac_address g_MacAddress;
+
+    extern uint8_t g_SessionHash[16];
+
+    extern std::string          g_AuthToken;
+    extern std::vector<uint8_t> g_AuthTokenBytes;
+    extern std::string          g_AuthTokenFile;
+
+    extern uint16_t g_AuthPort;
+    extern uint16_t g_PolPort;
+    extern uint16_t g_LoginViewPort;
+
+    extern bool  g_IsFirstLogin;
+    extern char* g_CharacterList;
+} // namespace globals
 
 // mbed tls state
 namespace sslState
@@ -54,7 +75,7 @@ namespace sslState
     extern mbedtls_ssl_config                conf;
     extern mbedtls_x509_crt                  cacert;
     extern std::unique_ptr<mbedtls_x509_crt> ca_chain;
-};
+}; // namespace sslState
 
 namespace xiloader
 {
@@ -127,7 +148,7 @@ namespace xiloader
         return 1;
     }
 
-     /**
+    /**
      * @brief Creates a connection to the auth server on the given port.
      *
      * @param sock      The datasocket object to store information within.
@@ -154,7 +175,7 @@ namespace xiloader
 
         if ((mbedtls_net_connect(&sslState::server_fd, globals::g_ServerAddress.c_str(), port, MBEDTLS_NET_PROTO_TCP)) != 0)
         {
-            xiloader::console::output(xiloader::color::error, "mbedtls_net_connect failed.");
+            xiloader::console::output(xiloader::color::error, "Could not connect to server: %s:%u", globals::g_ServerAddress.c_str(), port);
             return 0;
         }
 
@@ -225,81 +246,6 @@ namespace xiloader
     }
 
     /**
-     * @brief Creates a listening server on the given port and protocol.
-     *
-     * @param sock      The socket object to bind to.
-     * @param protocol  The protocol to use on the new listening socket.
-     * @param port      The port to bind to listen on.
-     *
-     * @return True on success, false otherwise.
-     */
-    bool network::CreateListenServer(SOCKET* sock, int protocol, const char* port)
-    {
-        struct addrinfo hints;
-        memset(&hints, 0x00, sizeof(hints));
-
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = protocol == IPPROTO_UDP ? SOCK_DGRAM : SOCK_STREAM;
-        hints.ai_protocol = protocol;
-        hints.ai_flags = AI_PASSIVE;
-
-        /* Attempt to resolve the local address.. */
-        struct addrinfo* addr = NULL;
-        if (getaddrinfo(NULL, port, &hints, &addr))
-        {
-            xiloader::console::output(xiloader::color::error, "Failed to obtain local address information.");
-            return false;
-        }
-
-        /* Create the listening socket.. */
-        *sock = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
-        if (*sock == INVALID_SOCKET)
-        {
-            xiloader::console::output(xiloader::color::error, "Failed to create listening socket.");
-
-            freeaddrinfo(addr);
-            return false;
-        }
-
-        /* Set socket option on internal server to allow sharing the port for multibox users */
-        if (setsockopt(*sock, SOL_SOCKET, SO_REUSEADDR, (char*)(&[] { return TRUE; }), sizeof(BOOL)) == SOCKET_ERROR)
-        {
-            xiloader::console::output(xiloader::color::error, "Failed to set reusable address option on socket. %d", WSAGetLastError());
-
-            freeaddrinfo(addr);
-            return false;
-        }
-
-        /* Bind to the local address.. */
-        if (bind(*sock, addr->ai_addr, (int)addr->ai_addrlen) == SOCKET_ERROR)
-        {
-            xiloader::console::output(xiloader::color::error, "Failed to bind to listening socket.");
-
-            freeaddrinfo(addr);
-            closesocket(*sock);
-            *sock = INVALID_SOCKET;
-            return false;
-        }
-
-        freeaddrinfo(addr);
-
-        /* Attempt to listen for clients if we are using TCP.. */
-        if (protocol == IPPROTO_TCP)
-        {
-            if (listen(*sock, SOMAXCONN) == SOCKET_ERROR)
-            {
-                xiloader::console::output(xiloader::color::error, "Failed to listen for connections.");
-
-                closesocket(*sock);
-                *sock = INVALID_SOCKET;
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    /**
      * @brief Resolves the given hostname to its long ip format.
      *
      * @param host      The host name to resolve.
@@ -312,7 +258,7 @@ namespace xiloader
         struct addrinfo hints, *info = 0;
         memset(&hints, 0, sizeof(hints));
 
-        hints.ai_family = AF_INET;
+        hints.ai_family   = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
         hints.ai_protocol = IPPROTO_TCP;
 
@@ -325,42 +271,32 @@ namespace xiloader
         return true;
     }
 
-    /**
-     * @brief Verifies the players login information; also handles creating new accounts.
-     *
-     * @param sock      The datasocket object with the connection socket.
-     *
-     * @return True on success, false otherwise.
-     */
-    bool network::VerifyAccount(datasocket* sock)
+    enum class AuthAction : uint8_t
     {
-        static bool bFirstLogin = true;
+        None              = 0,
+        Login             = 1,
+        CreateAccount     = 2,
+        ChangePassword    = 3,
+        GenerateAuthToken = 4,
+    };
 
-        unsigned char recvBuffer[1024] = { 0 };
-        unsigned char sendBuffer[1024] = { 0 };
-        std::string new_password       = "";
-        /* Create connection if required.. */
+    AuthAction promptAuthAction(datasocket* sock)
+    {
+        constexpr auto OptLogin          = "1";
+        constexpr auto OptCreateAccount  = "2";
+        constexpr auto OptChangePassword = "3";
+        constexpr auto OptGenAuthToken   = "4";
+        constexpr auto OptLoginAuthToken = "5";
 
-        // TODO: fix this check for TLS
-        /* if (sock->s == NULL || sock->s == INVALID_SOCKET)
-        {
-            if (!xiloader::network::CreateConnection(sock, g_LoginAuthPort.c_str()))
-                return false;
-        }*/
-
-        /* Determine if we should auto-login.. */
-        bool bUseAutoLogin = !globals::g_Username.empty() && !globals::g_Password.empty() && bFirstLogin;
-        if (bUseAutoLogin)
-            xiloader::console::output(xiloader::color::lightgreen, "Autologin activated!");
-
-        // TODO: kill all labels and gotos
-        if (!bUseAutoLogin)
+        while (true)
         {
             xiloader::console::output("==========================================================");
             xiloader::console::output("What would you like to do?");
             xiloader::console::output("   1.) Login");
             xiloader::console::output("   2.) Create New Account");
             xiloader::console::output("   3.) Change Account Password");
+            xiloader::console::output("   4.) Generate auth token");
+            xiloader::console::output("   5.) Login with auth token");
             xiloader::console::output("==========================================================");
             printf("\nEnter a selection: ");
 
@@ -368,438 +304,467 @@ namespace xiloader
             std::cin >> input;
             std::cout << std::endl;
 
-            /* User wants to log into an existing account or modify an existing account's password. */
-            if (input == "1" || input == "3")
+            /* User wants to log into an existing account, generate auth token, or modify an existing account's password. */
+            if (input == OptLogin || input == OptGenAuthToken || input == OptChangePassword)
             {
-                if (input == "3")
-                    xiloader::console::output("Before resetting your password, first verify your account details.");
-                xiloader::console::output("Please enter your login information.");
-                std::cout << "\nUsername: ";
-                std::cin >> globals::g_Username;
-                std::cout << "Password: ";
-                globals::g_Password.clear();
-
-                /* Read in each char and instead of displaying it. display a "*" */
-                char ch;
-                while ((ch = static_cast<char>(_getch())) != '\r')
+                if (input == OptChangePassword)
                 {
-                    if (ch == '\0')
-                        continue;
-                    else if (ch == '\b')
-                    {
-                        if (globals::g_Password.size())
-                        {
-                            globals::g_Password.pop_back();
-                            std::cout << "\b \b";
-                        }
-                    }
-                    else
-                    {
-                        globals::g_Password.push_back(ch);
-                        std::cout << '*';
-                    }
+                    xiloader::console::output("Before resetting your password, first verify your account details.");
                 }
+
+                xiloader::console::output("Please enter your login information.");
                 std::cout << std::endl;
 
-                char event_code = (input == "1") ? 0x10 : 0x30;
+                functions::PromptInput(globals::g_Username, globals::g_Username_MinLen, globals::g_Username_MaxLen, "Username");
+                functions::PromptMaskedInput(globals::g_Password, globals::g_Password_MinLen, globals::g_Password_MaxLen, "Password");
 
-                if (input == "3")
+                if (input == OptLogin)
                 {
-                    std::string confirmed_password = "";
-                    do
+                    return AuthAction::Login;
+                }
+                else if (input == OptGenAuthToken)
+                {
+                    return AuthAction::GenerateAuthToken;
+                }
+                else
+                {
+                    // Changing password
+                    std::string repeatedPassword = "";
+                    while (true)
                     {
-                        std::cout << "Enter new password (6-32 characters): ";
-                        confirmed_password = "";
-                        new_password       = "";
-                        std::cin >> new_password;
-                        std::cout << "Repeat Password           : ";
-                        std::cin >> confirmed_password;
-                        std::cout << std::endl;
+                        xiloader::console::output("Enter the new password.");
 
-                        if (new_password != confirmed_password)
+                        functions::PromptMaskedInput(globals::g_NewPassword, globals::g_Password_MinLen, globals::g_Password_MaxLen, "Password");
+                        functions::PromptMaskedInput(repeatedPassword, globals::g_Password_MinLen, globals::g_Password_MaxLen, "Repeat Password", "Password");
+
+                        if (globals::g_NewPassword == repeatedPassword)
+                        {
+                            break;
+                        }
+                        else
                         {
                             xiloader::console::output(xiloader::color::error, "Passwords did not match! Please try again.");
                         }
-                    } while (new_password != confirmed_password);
-                    new_password = confirmed_password;
+                    }
+                    globals::g_NewPassword = repeatedPassword;
+
+                    return AuthAction::ChangePassword;
                 }
-                sendBuffer[0x39] = event_code;
             }
             /* User wants to create a new account.. */
-            else if (input == "2")
+            else if (input == OptCreateAccount)
             {
-            create_account:
                 xiloader::console::output("Please enter your desired login information.");
-                std::cout << "\nUsername (3-15 characters): ";
-                std::cin >> globals::g_Username;
-                std::cout << "Password (6-32 characters): ";
-                globals::g_Password.clear();
-                std::cin >> globals::g_Password;
-                std::cout << "Repeat Password           : ";
-                std::cin >> input;
                 std::cout << std::endl;
 
-                // TODO: warn if username/password is too long
+                functions::PromptInput(globals::g_Username, globals::g_Username_MinLen, globals::g_Username_MaxLen, "Username");
+                functions::PromptInput(globals::g_Email, globals::g_Email_MinLen, globals::g_Email_MaxLen, "Email");
 
-                if (input != globals::g_Password)
+                while (true)
                 {
-                    xiloader::console::output(xiloader::color::error, "Passwords did not match! Please try again.");
-                    goto create_account;
+                    functions::PromptMaskedInput(globals::g_Password, globals::g_Password_MinLen, globals::g_Password_MaxLen, "Password");
+                    functions::PromptMaskedInput(input, globals::g_Password_MinLen, globals::g_Password_MaxLen, "Repeat Password", "Password");
+
+                    if (input == globals::g_Password)
+                    {
+                        break;
+                    }
+                    else
+                    {
+                        xiloader::console::output(xiloader::color::error, "Passwords did not match! Please try again.");
+                    }
                 }
 
-                sendBuffer[0x39] = 0x20;
+                // Create account
+                return AuthAction::CreateAccount;
+            }
+            else if (input == OptLoginAuthToken)
+            {
+                std::cout << "Auth token: ";
+                globals::g_AuthToken.clear();
+                std::cin >> globals::g_AuthToken;
+                std::cout << std::endl;
+
+                return AuthAction::Login;
+            }
+            else
+            {
+                xiloader::console::output(xiloader::color::error, "Invalid option.");
             }
 
             std::cout << std::endl;
         }
+    }
+
+    enum class AuthResult : uint8_t
+    {
+        LoginSuccess                = 0x01,
+        LoginError                  = 0x02,
+        LoginTokenError             = 0x03,
+        CreateAccountSuccess        = 0x04,
+        CreateAccountError          = 0x05,
+        CreateAccountErrorNameTaken = 0x06,
+        ChangePasswordSuccess       = 0x07,
+        ChangePasswordError         = 0x08,
+        GenAuthTokenSuccess         = 0x09,
+        GenAuthTokenError           = 0x10,
+        CustomErrorMessage          = 0xFF,
+    };
+
+    /**
+     * @brief Verifies the players login information; also handles creating new accounts.
+     *
+     * @param sock The datasocket object with the connection socket.
+     *
+     * @return True on success, false otherwise.
+     */
+    bool network::AuthRequest(datasocket* sock)
+    {
+        constexpr size_t BUFFER_SIZE = 1024;
+
+        uint8_t recvBuffer[BUFFER_SIZE] = { 0 };
+        uint8_t sendBuffer[BUFFER_SIZE] = { 0 };
+
+        /* Determine if we should auto-login.. */
+        bool bUseAutoLogin = globals::g_IsFirstLogin && (!globals::g_AuthToken.empty() || !globals::g_AuthTokenBytes.empty() || (!globals::g_Username.empty() && !globals::g_Password.empty()));
+        auto action        = bUseAutoLogin ? AuthAction::Login : AuthAction::None;
+
+        if (bUseAutoLogin)
+        {
+            xiloader::console::output(xiloader::color::lightgreen, "Autologin activated!");
+            // User has auto-login enabled, disable it for next time incase the authentication fails
+            globals::g_IsFirstLogin = false;
+
+            if (!globals::g_AuthTokenFile.empty() && !globals::g_Username.empty() && !globals::g_Password.empty())
+            {
+                // Generate auth token, if token file is specified along username and password
+                action = AuthAction::GenerateAuthToken;
+            }
+        }
+        else if (!globals::g_AuthToken.empty() || !globals::g_AuthTokenBytes.empty())
+        {
+            // If the auth token is not empty at this point, a token has just been generated, and we want to continue with a login.
+            action = AuthAction::Login;
+        }
         else
         {
-            /* User has auto-login enabled.. */
-            sendBuffer[0x39] = 0x10;
-            bFirstLogin = false;
+            action = promptAuthAction(sock);
         }
 
-        sendBuffer[0] = 0xFF; // Magic for new xiloader bits
-
-        sendBuffer[1] = 0x00; // Feature flags, none used yet.
-        sendBuffer[2] = 0x00;
-        sendBuffer[3] = 0x00;
-        sendBuffer[4] = 0x00;
-        sendBuffer[5] = 0x00;
-        sendBuffer[6] = 0x00;
-        sendBuffer[7] = 0x00;
-        sendBuffer[8] = 0x00;
-
-        /* Copy username and password into buffer.. */
-        memcpy(sendBuffer + 0x09, globals::g_Username.c_str(), globals::g_Username.length());
-        memcpy(sendBuffer + 0x19, globals::g_Password.c_str(), globals::g_Password.length());
-
-        /* Copy changed password into buffer */
-        memcpy(sendBuffer + 0x40, new_password.c_str(), 32);
-
-        // 17 byte wide operator specific space starting at 0x50 // This region will be used for anything server operators may install into custom launchers.
-
-        /* Copy version number into buffer */
-        memcpy(sendBuffer + 0x61, globals::g_VersionNumber.c_str(), 5);
-
-        /* Send info to server and obtain response.. */
-        mbedtls_ssl_write(&sslState::ssl, reinterpret_cast<const unsigned char*>(sendBuffer), 102);
-        mbedtls_ssl_read(&sslState::ssl, recvBuffer, 21);
-
-        /* Handle the obtained result.. */
-        switch (recvBuffer[0])
+        if (action == AuthAction::None)
         {
-            case 0x0001: // Success (Login)
+            return false;
+        }
+
+        bool didLoginWithToken = true;
+
+        /* Prepare the request */
+
+        // Magic bytes identifying this variation of xiloader
+        sendBuffer[0x00] = 'R';
+        sendBuffer[0x01] = 'E';
+        sendBuffer[0x02] = 'X';
+        sendBuffer[0x03] = 'I';
+
+        // Next 2 bytes saved for the length of the response
+        // 0x04
+        // 0x05
+
+        // Byte used to indicate the action to take
+        sendBuffer[0x06] = static_cast<uint8_t>(action);
+
+        // xiloader version number
+        sendBuffer[0x07] = XILOADER_MAJOR_VERSION;
+        sendBuffer[0x08] = XILOADER_MINOR_VERSION;
+        sendBuffer[0x09] = XILOADER_PATCH_VERSION;
+
+        // MAC address bytes
+        memcpy(sendBuffer + 0x0A, globals::g_MacAddress.bytes, 6);
+
+        // End of header bytes. Start keeping track of current send length
+        uint32_t sendLength = 16;
+
+        // Add in authentication bytes
+        if (!globals::g_Username.empty() && !globals::g_Password.empty())
+        {
+            // Byte to indicate it's a user/pass auth request
+            sendBuffer[sendLength++] = 0x01;
+            didLoginWithToken        = false;
+            xiloader::console::output(xiloader::color::lightgreen, "Authenticating with username and password.");
+
+            // All requests require at least the username and password
+            if (globals::g_Username.length() > globals::g_Username_MaxLen)
             {
-                xiloader::console::output(xiloader::color::success, "Successfully logged in as %s!", globals::g_Username.c_str());
+                xiloader::console::output(xiloader::color::error, "Failed to login. Username is too long.");
+                return false;
+            }
+            if (globals::g_Username.length() < globals::g_Username_MinLen)
+            {
+                xiloader::console::output(xiloader::color::error, "Failed to login. Username is too short.");
+                return false;
+            }
 
-                sock->AccountId = ref<UINT32>(recvBuffer, 1);
-                std::memcpy(&globals::g_SessionHash, recvBuffer + 5, sizeof(globals::g_SessionHash));
+            static_assert(globals::g_Username_MaxLen == 32);
+            memcpy(sendBuffer + sendLength, globals::g_Username.c_str(), globals::g_Username.length());
+            sendLength += globals::g_Username_MaxLen;
 
-                shutdown(sock->s, SD_BOTH);
-                closesocket(sock->s);
-                sock->s = INVALID_SOCKET;
+            if (globals::g_Password.length() > globals::g_Password_MaxLen)
+            {
+                xiloader::console::output(xiloader::color::error, "Failed to login. Password is too long.");
+                return false;
+            }
+            if (globals::g_Password.length() < globals::g_Password_MinLen)
+            {
+                xiloader::console::output(xiloader::color::error, "Failed to login. Password is too short.");
+                return false;
+            }
+
+            static_assert(globals::g_Password_MaxLen == 32);
+            memcpy(sendBuffer + sendLength, globals::g_Password.c_str(), globals::g_Password.length());
+            sendLength += globals::g_Password_MaxLen;
+            globals::g_Password.clear();
+        }
+
+        else if (!globals::g_AuthToken.empty() || !globals::g_AuthTokenBytes.empty())
+        {
+            // Byte to indicate it's a token auth request
+            sendBuffer[sendLength++] = 0x02;
+            didLoginWithToken        = true;
+            xiloader::console::output(xiloader::color::lightgreen, "Authenticating with token.");
+
+            if (!globals::g_AuthToken.empty())
+            {
+                globals::g_AuthTokenBytes = functions::Base64Decode(globals::g_AuthToken);
+                globals::g_AuthToken.clear();
+            }
+
+            if (globals::g_AuthTokenBytes.empty())
+            {
+                // Invalid token
+                xiloader::console::output(xiloader::color::error, "Failed to login. Auth token could not be decoded.");
+                return false;
+            }
+
+            // Set length of auth token bytes
+            ref<uint16_t>(sendBuffer, sendLength) = static_cast<uint16_t>(globals::g_AuthTokenBytes.size());
+            sendLength += 2;
+
+            // Add in the auth token bytes, if it fits
+            auto startOffset = sendLength;
+            sendLength += globals::g_AuthTokenBytes.size();
+
+            if (sendLength > BUFFER_SIZE)
+            {
+                // Token too long
+                xiloader::console::output(xiloader::color::error, "Failed to login. Auth token too long.");
+                return false;
+            }
+
+            memcpy(sendBuffer + startOffset, globals::g_AuthTokenBytes.data(), globals::g_AuthTokenBytes.size());
+            globals::g_AuthTokenBytes.clear();
+        }
+
+        else
+        {
+            // Invalid auth method
+            xiloader::console::output(xiloader::color::error, "Failed to login. No valid authentication method was provided.");
+            return false;
+        }
+
+        // Request-specific content starts at byte 0x40
+        switch (action)
+        {
+            case AuthAction::Login:
+            case AuthAction::GenerateAuthToken:
+            {
+                break;
+            }
+            case AuthAction::CreateAccount:
+            {
+                if (globals::g_Email.length() > globals::g_Email_MaxLen)
+                {
+                    xiloader::console::output(xiloader::color::error, "Failed to create account. E-mail is too long.");
+                    return false;
+                }
+
+                static_assert(globals::g_Email_MaxLen == 64);
+                memcpy(sendBuffer + sendLength, globals::g_Email.c_str(), globals::g_Email.length());
+                sendLength += globals::g_Email_MaxLen;
+                globals::g_Email.clear();
+
+                break;
+            }
+            case AuthAction::ChangePassword:
+            {
+                if (globals::g_NewPassword.length() > globals::g_Password_MaxLen)
+                {
+                    xiloader::console::output(xiloader::color::error, "Failed to change password. New password is too long.");
+                    return false;
+                }
+                if (globals::g_NewPassword.length() < globals::g_Password_MinLen)
+                {
+                    xiloader::console::output(xiloader::color::error, "Failed to change password. New password is too short.");
+                    return false;
+                }
+
+                static_assert(globals::g_Password_MaxLen == 32);
+                memcpy(sendBuffer + sendLength, globals::g_NewPassword.c_str(), globals::g_NewPassword.length());
+                sendLength += globals::g_Password_MaxLen;
+                globals::g_NewPassword.clear();
+
+                break;
+            }
+            default:
+            {
+                return false;
+            }
+        }
+
+        // Set the final length of data in buffer
+        ref<uint16_t>(sendBuffer, 0x04) = sendLength;
+
+        // Send info to server and obtain response
+        mbedtls_ssl_write(&sslState::ssl, reinterpret_cast<const unsigned char*>(sendBuffer), sendLength);
+        auto bytesRead = mbedtls_ssl_read(&sslState::ssl, recvBuffer, BUFFER_SIZE);
+
+        if (bytesRead == 0)
+        {
+            // Connection was closed
+            xiloader::console::output(xiloader::color::error, "Connection lost with server. Closing...");
+            Sleep(1000);
+            exit(1);
+        }
+
+        // Handle the obtained result
+        switch (static_cast<AuthResult>(recvBuffer[0]))
+        {
+            case AuthResult::LoginSuccess:
+            {
+                if (!didLoginWithToken)
+                {
+                    xiloader::console::output(xiloader::color::success, "Successfully logged in as %s!", globals::g_Username.c_str());
+                }
+                else
+                {
+                    xiloader::console::output(xiloader::color::success, "Successfully logged in!");
+                }
+                std::memcpy(&globals::g_SessionHash, recvBuffer + 1, sizeof(globals::g_SessionHash));
+                globals::g_PolPort       = ref<uint16_t>(recvBuffer, 17);
+                globals::g_LoginViewPort = ref<uint16_t>(recvBuffer, 19);
+
                 return true;
             }
-            case 0x0002: // Error (Login)
+            case AuthResult::LoginError:
             {
                 xiloader::console::output(xiloader::color::error, "Failed to login. Invalid username or password.");
-                closesocket(sock->s);
-                sock->s = INVALID_SOCKET;
                 return false;
             }
-            case 0x0003: // Success (Create Account)
+            case AuthResult::LoginTokenError:
+            {
+                xiloader::console::output(xiloader::color::error, "Failed to login. Invalid auth token.");
+
+                // Delete the invalid token file if provided
+                if (!globals::g_AuthTokenFile.empty())
+                {
+                    std::remove(globals::g_AuthTokenFile.c_str());
+                }
+
+                // Exit with error code indicating invalid auth token
+                Sleep(1000);
+                exit(5);
+            }
+            case AuthResult::CreateAccountSuccess:
             {
                 xiloader::console::output(xiloader::color::success, "Account successfully created!");
-                closesocket(sock->s);
-                sock->s = INVALID_SOCKET;
                 return false;
             }
-            case 0x0004: // Error (Create Account)
+            case AuthResult::CreateAccountError:
+            {
+                xiloader::console::output(xiloader::color::error, "Failed to create the new account.");
+                return false;
+            }
+            case AuthResult::CreateAccountErrorNameTaken:
             {
                 xiloader::console::output(xiloader::color::error, "Failed to create the new account. Username already taken.");
-                closesocket(sock->s);
-                sock->s = INVALID_SOCKET;
                 return false;
             }
-            case 0x0006: // Success (Changed Password)
+
+            case AuthResult::ChangePasswordSuccess:
             {
                 xiloader::console::output(xiloader::color::success, "Password updated successfully!");
                 std::cout << std::endl;
                 globals::g_Password.clear();
-                closesocket(sock->s);
-                sock->s = INVALID_SOCKET;
                 return false;
             }
-            case 0x0007: // Error (Changed Password)
+            case AuthResult::ChangePasswordError:
             {
                 xiloader::console::output(xiloader::color::error, "Failed to change password.");
                 std::cout << std::endl;
                 globals::g_Password.clear();
-                closesocket(sock->s);
-                sock->s = INVALID_SOCKET;
                 return false;
             }
 
-            // Commands 0x0008 through 0x0008 are currently unused
-
-            case 0x000A:
+            case AuthResult::GenAuthTokenSuccess:
             {
-                xiloader::console::output(xiloader::color::error, "Failed to login. Account already logged in.");
-                closesocket(sock->s);
-                sock->s = INVALID_SOCKET;
+                std::string tokenStr = functions::Base64Encode(recvBuffer + 1, bytesRead - 1);
+                if (tokenStr.empty())
+                {
+                    xiloader::console::output(xiloader::color::error, "Successfully generated auth token, but failed to encode it to a string.");
+                }
+                else
+                {
+                    xiloader::console::output(xiloader::color::success, "Successfully generated auth token:");
+                    std::cout << std::endl
+                              << tokenStr << std::endl
+                              << std::endl;
+                }
+
+                if (bUseAutoLogin)
+                {
+                    // Store bytes in memory and in specified file if given
+                    globals::g_AuthTokenBytes = functions::Base64Decode(tokenStr);
+
+                    if (!globals::g_AuthTokenFile.empty())
+                    {
+                        std::ofstream tokenFile;
+                        tokenFile.open(globals::g_AuthTokenFile, std::ios_base::out | std::ios_base::binary);
+                        if (!tokenFile.is_open())
+                        {
+                            xiloader::console::output(xiloader::color::error, "Failed to write token to file.");
+                            return false;
+                        }
+
+                        tokenFile.write((char*)&globals::g_AuthTokenBytes[0], globals::g_AuthTokenBytes.size());
+                        tokenFile.flush();
+                        tokenFile.close();
+                        xiloader::console::output(xiloader::color::success, "Auth token has been saved to a file.");
+                    }
+                }
+
                 return false;
             }
-            case 0x000B:
+
+            case AuthResult::GenAuthTokenError:
             {
-                xiloader::console::output(xiloader::color::error, "Failed to login. Expected xiloader version mismatch; check with your provider.");
-                closesocket(sock->s);
-                sock->s = INVALID_SOCKET;
+                xiloader::console::output(xiloader::color::error, "Failed to generate auth token. Invalid login information.");
+                return false;
+            }
+
+            case AuthResult::CustomErrorMessage:
+            {
+                std::string message(recvBuffer + 1, recvBuffer + bytesRead);
+                xiloader::console::output(xiloader::color::error, "%s", message);
+                return false;
+            }
+
+            default:
+            {
+                xiloader::console::output(xiloader::color::error, "Unexpected server response: 0x%02X", recvBuffer[0]);
                 return false;
             }
         }
 
-        /* We should not get here.. */
-        closesocket(sock->s);
-        sock->s = INVALID_SOCKET;
         return false;
-    }
-
-    /**
-     * @brief Data communication between the local client and the game server.
-     *
-     * @param lpParam   Thread param object.
-     *
-     * @return Non-important return.
-     */
-    DWORD __stdcall network::FFXiDataComm(LPVOID lpParam)
-    {
-        auto sock = (xiloader::datasocket*)lpParam;
-
-        int sendSize = 0;
-        char recvBuffer[4096] = { 0 };
-        char sendBuffer[4096] = { 0 };
-
-        struct sockaddr_in client;
-        unsigned int       socksize = sizeof(client);
-
-        // send session hash
-        sendBuffer[0] = 0xFE;
-        memcpy(sendBuffer + 12, globals::g_SessionHash, 16);
-
-        auto result = send(sock->s, sendBuffer, 28, 0);
-        if (result == SOCKET_ERROR)
-        {
-            shutdown(sock->s, SD_SEND);
-            closesocket(sock->s);
-            sock->s = INVALID_SOCKET;
-
-            xiloader::console::output("Failed to send session hash for data to server; disconnecting!");
-            return 0;
-        }
-        memset(sendBuffer, 0, 28);
-
-        while (globals::g_IsRunning)
-        {
-            /* Attempt to receive the incoming data.. */
-            if (recvfrom(sock->s, recvBuffer, sizeof(recvBuffer), 0, (struct sockaddr*)&client, (int*)&socksize) <= 0)
-            {
-                /*
-                Under some conditions, this recvfrom call would immediately error with a WSAGetLastError value of 0 when no data was waiting.
-                This would cause the call to occur over and over, saturating a cpu thread.
-                */
-                if (WSAGetLastError() == 0)
-                {
-                    Sleep(100);
-                }
-                continue;
-            }
-
-            switch (recvBuffer[0])
-            {
-            case 0x0001:
-                sendBuffer[0] = 0xA1u;
-                memcpy(sendBuffer + 0x01, &sock->AccountId, 4);
-                memcpy(sendBuffer + 0x05, &sock->ServerAddress, 4);
-                memcpy(sendBuffer + 12, globals::g_SessionHash, 16);
-
-                xiloader::console::output(xiloader::color::warning, "Sending account id..");
-                sendSize = 28;
-                break;
-
-            case 0x0002:
-            case 0x0015:
-                memcpy(sendBuffer, (char*)"\xA2\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x58\xE0\x5D\xAD\x00\x00\x00\x00", 25);
-
-                xiloader::console::output(xiloader::color::warning, "Sending key..");
-                sendSize = 28;
-                break;
-
-            case 0x0003:
-                xiloader::console::output(xiloader::color::warning, "Receiving character list..");
-                for (auto x = 0; x < recvBuffer[1]; x++)
-                {
-                    globals::g_CharacterList[0x00 + (x * 0x68)] = 1;
-                    globals::g_CharacterList[0x02 + (x * 0x68)] = 1;
-                    globals::g_CharacterList[0x10 + (x * 0x68)] = (char)x;
-                    globals::g_CharacterList[0x11 + (x * 0x68)] = 0x80u;
-                    globals::g_CharacterList[0x18 + (x * 0x68)] = 0x20;
-                    globals::g_CharacterList[0x28 + (x * 0x68)] = 0x20;
-
-                    memcpy(globals::g_CharacterList + 0x04 + (x * 0x68), recvBuffer + 0x10 * (x + 1) + 0x04, 4); // Character Id
-                    memcpy(globals::g_CharacterList + 0x08 + (x * 0x68), recvBuffer + 0x10 * (x + 1), 4);        // Content Id
-                }
-                sendSize = 0;
-                break;
-            }
-
-            if (sendSize == 0)
-                continue;
-
-            /* Send the response buffer to the server.. */
-            auto result = sendto(sock->s, sendBuffer, sendSize, 0, (struct sockaddr*)&client, socksize);
-            if (sendSize == 72 || result == SOCKET_ERROR || sendSize == -1)
-            {
-                shutdown(sock->s, SD_SEND);
-                closesocket(sock->s);
-                sock->s = INVALID_SOCKET;
-
-                xiloader::console::output("Server connection done; disconnecting!");
-                return 0;
-            }
-
-            sendSize = 0;
-            Sleep(100);
-        }
-
-        return 0;
-    }
-
-    /**
-     * @brief Data communication between the local client and the lobby server.
-     *
-     * @param lpParam   Thread param object.
-     *
-     * @return Non-important return.
-     */
-    DWORD __stdcall network::PolDataComm(LPVOID lpParam)
-    {
-        SOCKET client = *(SOCKET*)lpParam;
-        unsigned char recvBuffer[1024] = { 0 };
-        int result = 0, x = 0;
-        time_t t = 0;
-        bool bIsNewChar = false;
-
-        do
-        {
-            /* Attempt to receive incoming data.. */
-            result = recv(client, (char*)recvBuffer, sizeof(recvBuffer), 0);
-            if (result <= 0)
-            {
-                xiloader::console::output(xiloader::color::error, "Client recv failed: %d", WSAGetLastError());
-                break;
-            }
-
-            char temp = recvBuffer[0x04];
-            memset(recvBuffer, 0x00, 32);
-
-            switch (x)
-            {
-            case 0:
-                recvBuffer[0] = 0x81;
-                t = time(NULL);
-                memcpy(recvBuffer + 0x14, &t, 4);
-                result = 24;
-                break;
-
-            case 1:
-                if (temp != 0x28)
-                    bIsNewChar = true;
-                recvBuffer[0x00] = 0x28;
-                recvBuffer[0x04] = 0x20;
-                recvBuffer[0x08] = 0x01;
-                recvBuffer[0x0B] = 0x7F;
-                result = bIsNewChar ? 144 : 24;
-                if (bIsNewChar) bIsNewChar = false;
-                break;
-            }
-
-            /* Echo back the buffer to the server.. */
-            if (send(client, (char*)recvBuffer, result, 0) == SOCKET_ERROR)
-            {
-                xiloader::console::output(xiloader::color::error, "Client send failed: %d", WSAGetLastError());
-                break;
-            }
-
-            /* Increase the current packet count.. */
-            x++;
-            if (x == 3)
-                break;
-
-        } while (result > 0);
-
-        /* Shutdown the client socket.. */
-        if (shutdown(client, SD_SEND) == SOCKET_ERROR)
-            xiloader::console::output(xiloader::color::error, "Client shutdown failed: %d", WSAGetLastError());
-        closesocket(client);
-
-        return 0;
-    }
-
-    /**
-     * @brief Starts the data communication between the client and server.
-     *
-     * @param lpParam   Thread param object.
-     *
-     * @return Non-important return.
-     */
-    DWORD __stdcall network::FFXiServer(LPVOID lpParam)
-    {
-        /* Attempt to create connection to the server.. */
-        if (!xiloader::network::CreateConnection((xiloader::datasocket*)lpParam, globals::g_LoginDataPort.c_str()))
-            return 1;
-
-        /* Attempt to start data communication with the server.. */
-        CreateThread(NULL, 0, xiloader::network::FFXiDataComm, lpParam, 0, NULL);
-        Sleep(200);
-
-        return 0;
-    }
-
-    /**
-     * @brief Starts the local listen server to lobby server communications.
-     *
-     * @param lpParam   Thread param object.
-     *
-     * @return Non-important return.
-     */
-    DWORD __stdcall network::PolServer(LPVOID lpParam)
-    {
-        UNREFERENCED_PARAMETER(lpParam);
-
-        SOCKET sock, client;
-
-        /* Attempt to create listening server.. */
-        if (!xiloader::network::CreateListenServer(&sock, IPPROTO_TCP, globals::g_ServerPort.c_str()))
-            return 1;
-
-        while (globals::g_IsRunning)
-        {
-            /* Attempt to accept incoming connections.. */
-            if ((client = accept(sock, NULL, NULL)) == INVALID_SOCKET)
-            {
-                xiloader::console::output(xiloader::color::error, "Accept failed: %d", WSAGetLastError());
-
-                closesocket(sock);
-                return 1;
-            }
-
-            /* Start data communication for this client.. */
-            CreateThread(NULL, 0, xiloader::network::PolDataComm, &client, 0, NULL);
-        }
-
-        closesocket(sock);
-        return 0;
     }
 
 }; // namespace xiloader

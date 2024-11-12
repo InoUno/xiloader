@@ -1,11 +1,11 @@
 1 VERSIONINFO
-FILEVERSION 1,1,1
+FILEVERSION @MAJOR_VERSION@,@MINOR_VERSION@,@PATCH_VERSION@
 BEGIN
     BLOCK "StringFileInfo"
     BEGIN
         BLOCK "081604b0"
         BEGIN
-            VALUE "FileVersion", "1.1.2"
+            VALUE "FileVersion", XILOADER_VERSION_STRING
         END
     END
 END

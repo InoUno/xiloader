@@ -24,56 +24,56 @@ This file is part of DarkStar-server source code.
 #ifndef __XILOADER_CONSOLE_H_INCLUDED__
 #define __XILOADER_CONSOLE_H_INCLUDED__
 
-#if defined (_MSC_VER) && (_MSC_VER >= 1020)
+#if defined(_MSC_VER) && (_MSC_VER >= 1020)
 #pragma once
 #endif
 
-#include <windows.h>
+#include <ctime>
 #include <iostream>
 #include <string>
-#include <ctime>
+#include <windows.h>
 
 namespace xiloader
 {
     /**
-    * @brief Console color enumeration.
-    */
+     * @brief Console color enumeration.
+     */
     enum class color
     {
         /* Red color codes. */
-        red = FOREGROUND_RED,
+        red      = FOREGROUND_RED,
         lightred = FOREGROUND_RED | FOREGROUND_INTENSITY,
 
         /* Green color codes. */
-        green = FOREGROUND_GREEN,
+        green      = FOREGROUND_GREEN,
         lightgreen = FOREGROUND_GREEN | FOREGROUND_INTENSITY,
 
         /* Blue color codes. */
-        blue = FOREGROUND_BLUE,
+        blue      = FOREGROUND_BLUE,
         lightblue = FOREGROUND_BLUE | FOREGROUND_INTENSITY,
 
         /* Cyan color codes. */
-        cyan = FOREGROUND_BLUE | FOREGROUND_GREEN,
+        cyan      = FOREGROUND_BLUE | FOREGROUND_GREEN,
         lightcyan = FOREGROUND_BLUE | FOREGROUND_GREEN | FOREGROUND_INTENSITY,
 
         /* Yellow color codes. */
-        yellow = FOREGROUND_GREEN | FOREGROUND_RED,
-        lightyelllow = FOREGROUND_GREEN | FOREGROUND_RED | FOREGROUND_INTENSITY,
+        yellow      = FOREGROUND_GREEN | FOREGROUND_RED,
+        lightyellow = FOREGROUND_GREEN | FOREGROUND_RED | FOREGROUND_INTENSITY,
 
         /* Purple color codes. */
-        purple = FOREGROUND_BLUE | FOREGROUND_RED,
+        purple      = FOREGROUND_BLUE | FOREGROUND_RED,
         lightpurple = FOREGROUND_BLUE | FOREGROUND_RED | FOREGROUND_INTENSITY,
 
         /* White color codes. */
-        grey = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE,
+        grey  = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE,
         white = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY,
 
         /* Common color codes. */
-        debug = lightcyan,
-        error = lightred,
-        info = white,
+        debug   = lightcyan,
+        error   = lightred,
+        info    = white,
         success = lightgreen,
-        warning = lightyelllow
+        warning = lightyellow
     };
 
     /**
@@ -82,7 +82,6 @@ namespace xiloader
     class console
     {
     private:
-
         /**
          * @brief Shows or hides the console based on the provided argument.
          *
@@ -91,10 +90,9 @@ namespace xiloader
         static void visible(bool visible);
 
     public:
-
         /**
          * @brief Prints a text fragment with the specified color to the console.
-         * 
+         *
          * @param c         The color to print the fragment with.
          * @param message   The fragment to print.
          */
@@ -106,7 +104,7 @@ namespace xiloader
          * @param format    The format of the message to print.
          * @param args      The arguments to fill the format.
          */
-        template<typename... Args>
+        template <typename... Args>
         static void output(char const* format, Args... args)
         {
             output(xiloader::color::white, format, args...);
@@ -134,13 +132,13 @@ namespace xiloader
          * @param format    The format of the message to print.
          * @param args      The arguments to fill the format.
          */
-        template<typename... Args>
+        template <typename... Args>
         static void output(xiloader::color c, char const* format, Args... args)
         {
             std::string timestamp = getTimestamp();
 
             /* Output the timestamp */
-            print(xiloader::color::lightyelllow, timestamp.c_str());
+            print(xiloader::color::lightyellow, timestamp.c_str());
 
             /* Parse the incoming message */
             char buffer[1024];

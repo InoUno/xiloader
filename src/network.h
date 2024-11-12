@@ -24,24 +24,23 @@ This file is part of DarkStar-server source code.
 #ifndef __XILOADER_NETWORK_H_INCLUDED__
 #define __XILOADER_NETWORK_H_INCLUDED__
 
-#if defined (_MSC_VER) && (_MSC_VER >= 1020)
+#if defined(_MSC_VER) && (_MSC_VER >= 1020)
 #pragma once
 #endif
 
+#include <conio.h>
+#include <string>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <windows.h>
-#include <string>
-#include <conio.h>
 
 #include "console.h"
 
-#include "mbedtls/net_sockets.h"
-#include "mbedtls/debug.h"
-#include "mbedtls/ssl.h"
-#include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
+#include "mbedtls/debug.h"
+#include "mbedtls/entropy.h"
 #include "mbedtls/error.h"
+#include "mbedtls/net_sockets.h"
+#include "mbedtls/ssl.h"
 
 namespace xiloader
 {
@@ -50,13 +49,16 @@ namespace xiloader
      */
     typedef struct datasocket_t
     {
-        datasocket_t() : s(INVALID_SOCKET), AccountId(0), LocalAddress((ULONG)-1), ServerAddress((ULONG)-1)
-        {}
+        datasocket_t()
+        : s(INVALID_SOCKET)
+        , LocalAddress((ULONG)-1)
+        , ServerAddress((ULONG)-1)
+        {
+        }
 
         SOCKET s;
-        UINT32 AccountId;
-        ULONG LocalAddress;
-        ULONG ServerAddress;
+        ULONG  LocalAddress;
+        ULONG  ServerAddress;
     } datasocket;
 
     /**
@@ -73,17 +75,7 @@ namespace xiloader
          */
         static DWORD __stdcall FFXiDataComm(LPVOID lpParam);
 
-        /**
-         * @brief Data communication between the local client and the lobby server.
-         *
-         * @param lpParam       Thread param object.
-         *
-         * @return Non-important return.
-         */
-        static DWORD __stdcall PolDataComm(LPVOID lpParam);
-        
     public:
-
         /**
          * @brief Creates a connection on the given port.
          *
@@ -94,9 +86,8 @@ namespace xiloader
          */
         static bool CreateConnection(datasocket* sock, const char* port);
 
-
         /**
-         * @brief Creates a connection to the auth server on the given port.
+         * @brief Creates a connection to the server on the given port.
          *
          * @param sock          The datasocket object to store information within.
          * @param port          The port to create the connection on.
@@ -105,17 +96,6 @@ namespace xiloader
          */
         static bool CreateAuthConnection(datasocket* sock, const char* port);
 
-        /**
-         * @brief Creates a listening server on the given port and protocol.
-         *
-         * @param sock          The socket object to bind to.
-         * @param protocol      The protocol to use on the new listening socket.
-         * @param port          The port to bind to listen on.
-         *
-         * @return True on success, false otherwise.
-         */
-        static bool CreateListenServer(SOCKET* sock, int protocol, const char* port);
-        
         /**
          * @brief Resolves the given hostname to its long ip format.
          *
@@ -127,31 +107,13 @@ namespace xiloader
         static bool ResolveHostname(const char* host, PULONG lpOutput);
 
         /**
-         * @brief Verifies the players login information; also handles creating new accounts.
+         * @brief Sends authentication requests to the server.
          *
          * @param sock          The datasocket object with the connection socket.
          *
          * @return True on success, false otherwise.
          */
-        static bool VerifyAccount(datasocket* sock);
-        
-        /**
-         * @brief Starts the data communication between the client and server.
-         *
-         * @param lpParam       Thread param object.
-         *
-         * @return Non-important return.
-         */
-        static DWORD __stdcall FFXiServer(LPVOID lpParam);
-
-        /**
-         * @brief Starts the local listen server to lobby server communications.
-         *
-         * @param lpParam       Thread param object.
-         *
-         * @return Non-important return.
-         */
-        static DWORD __stdcall PolServer(LPVOID lpParam);
+        static bool AuthRequest(datasocket* sock);
     };
 
 }; // namespace xiloader

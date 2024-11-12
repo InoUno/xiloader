@@ -1,5 +1,8 @@
 name: release
 
+permissions:
+  contents: write
+
 on:
   push:
     tags:
@@ -28,13 +31,13 @@ jobs:
         id: hashes
         shell: pwsh
         run: |
-          $exe_hash = $(Get-FileHash xiloader.exe -Algorithm MD5).hash
+          $exe_hash = $(Get-FileHash build/Release/xiloader.exe -Algorithm MD5).hash
           "::set-output name=exe_hash::$($exe_hash)"
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }} # This token is provided by Actions, you do not need to create your own token
-          files: xiloader.exe
+          files: build/Release/xiloader.exe
           body: |
             MD5: ${{ steps.hashes.outputs.exe_hash }}
           draft: false
